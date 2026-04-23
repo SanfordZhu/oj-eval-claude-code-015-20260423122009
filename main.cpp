@@ -29,6 +29,9 @@ private:
         }
     };
 
+    vector<IndexEntry> indexCache;  // Keep index in memory
+    bool indexModified = false;     // Track if index needs to be written back
+
     vector<int> readValues(int64_t offset, int32_t count) {
         vector<int> values(count);
 
@@ -43,37 +46,37 @@ private:
         return values;
     }
 
-    vector<IndexEntry> readIndex() {
-        vector<IndexEntry> index;
-
+    void loadIndex() {
         if (!fs::exists(indexFile)) {
-            return index;
+            return;
         }
 
         ifstream idx(indexFile, ios::binary);
-        if (!idx) return index;
+        if (!idx) return;
 
         int32_t size;
         idx.read(reinterpret_cast<char*>(&size), sizeof(size));
 
-        index.resize(size);
+        indexCache.resize(size);
         for (int i = 0; i < size; i++) {
-            idx.read(reinterpret_cast<char*>(&index[i]), sizeof(IndexEntry));
+            idx.read(reinterpret_cast<char*>(&indexCache[i]), sizeof(IndexEntry));
         }
-
-        return index;
     }
 
-    void writeIndex(const vector<IndexEntry>& index) {
+    void saveIndex() {
+        if (!indexModified) return;
+
         ofstream idx(indexFile, ios::binary);
         if (!idx) return;
 
-        int32_t size = index.size();
+        int32_t size = indexCache.size();
         idx.write(reinterpret_cast<const char*>(&size), sizeof(size));
 
-        for (const auto& entry : index) {
+        for (const auto& entry : indexCache) {
             idx.write(reinterpret_cast<const char*>(&entry), sizeof(IndexEntry));
         }
+
+        indexModified = false;
     }
 
 public:
@@ -87,19 +90,25 @@ public:
             int32_t zero = 0;
             idx.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
         }
+
+        // Load index into memory
+        loadIndex();
+    }
+
+    ~FileStorage() {
+        // Save index back to file on exit
+        saveIndex();
     }
 
     void insert(const string& index, int value) {
-        auto idx = readIndex();
-
         // Find the index entry
-        auto it = find_if(idx.begin(), idx.end(), [&](const IndexEntry& e) {
+        auto it = find_if(indexCache.begin(), indexCache.end(), [&](const IndexEntry& e) {
             return string(e.index) == index;
         });
 
         vector<int> values;
 
-        if (it != idx.end()) {
+        if (it != indexCache.end()) {
             // Read existing values
             values = readValues(it->offset, it->count);
         }
@@ -122,7 +131,7 @@ public:
             data.write(reinterpret_cast<const char*>(&v), sizeof(int));
         }
 
-        if (it != idx.end()) {
+        if (it != indexCache.end()) {
             // Update existing entry
             it->offset = offset;
             it->count = values.size();
@@ -133,26 +142,24 @@ public:
             newEntry.index[64] = '\0';
             newEntry.offset = offset;
             newEntry.count = values.size();
-            idx.push_back(newEntry);
+            indexCache.push_back(newEntry);
 
             // Sort index by index name
-            sort(idx.begin(), idx.end(), [](const IndexEntry& a, const IndexEntry& b) {
+            sort(indexCache.begin(), indexCache.end(), [](const IndexEntry& a, const IndexEntry& b) {
                 return strcmp(a.index, b.index) < 0;
             });
         }
 
-        writeIndex(idx);
+        indexModified = true;
     }
 
     void remove(const string& index, int value) {
-        auto idx = readIndex();
-
         // Find the index entry
-        auto it = find_if(idx.begin(), idx.end(), [&](const IndexEntry& e) {
+        auto it = find_if(indexCache.begin(), indexCache.end(), [&](const IndexEntry& e) {
             return string(e.index) == index;
         });
 
-        if (it == idx.end()) return;
+        if (it == indexCache.end()) return;
 
         // Read values
         vector<int> values = readValues(it->offset, it->count);
@@ -164,8 +171,7 @@ public:
 
             if (values.empty()) {
                 // Remove the index entry entirely
-                idx.erase(it);
-                writeIndex(idx);
+                indexCache.erase(it);
             } else {
                 // Write back
                 fstream data(dataFile, ios::binary | ios::in | ios::out);
@@ -177,20 +183,19 @@ public:
                 }
 
                 it->count = values.size();
-                writeIndex(idx);
             }
+
+            indexModified = true;
         }
     }
 
     string find(const string& index) {
-        auto idx = readIndex();
-
         // Find the index entry
-        auto it = find_if(idx.begin(), idx.end(), [&](const IndexEntry& e) {
+        auto it = find_if(indexCache.begin(), indexCache.end(), [&](const IndexEntry& e) {
             return string(e.index) == index;
         });
 
-        if (it == idx.end()) {
+        if (it == indexCache.end()) {
             return "null";
         }
 
