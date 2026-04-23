@@ -7,155 +7,194 @@
 #include <filesystem>
 #include <unordered_map>
 #include <cstring>
+#include <map>
 
 using namespace std;
 namespace fs = std::filesystem;
 
 class FileStorage {
 private:
-    string baseDir;
-    static const int BUCKET_COUNT = 100; // Use 100 buckets to reduce file count
+    string dataFile = "storage.dat";
+    string indexFile = "index.dat";
 
-    int getBucketIndex(const string& index) {
-        // Simple hash function
-        int hash = 0;
-        for (char c : index) {
-            hash = hash * 31 + c;
-        }
-        return abs(hash) % BUCKET_COUNT;
-    }
-
-    string getBucketFilename(int bucketIdx) {
-        return baseDir + "/bucket_" + to_string(bucketIdx) + ".dat";
-    }
-
-    struct Entry {
+    struct IndexEntry {
         char index[65]; // 64 bytes + null terminator
-        int value;
+        int64_t offset; // File offset for data
+        int32_t count;  // Number of values
 
-        Entry() {
+        IndexEntry() {
             memset(index, 0, sizeof(index));
-            value = 0;
-        }
-
-        Entry(const string& idx, int val) {
-            strncpy(index, idx.c_str(), 64);
-            index[64] = '\0';
-            value = val;
+            offset = 0;
+            count = 0;
         }
     };
 
-    vector<Entry> readBucket(int bucketIdx) {
-        vector<Entry> entries;
-        string filename = getBucketFilename(bucketIdx);
+    vector<int> readValues(int64_t offset, int32_t count) {
+        vector<int> values(count);
 
-        if (!fs::exists(filename)) {
-            return entries;
+        ifstream data(dataFile, ios::binary);
+        if (!data) return values;
+
+        data.seekg(offset);
+        for (int i = 0; i < count; i++) {
+            data.read(reinterpret_cast<char*>(&values[i]), sizeof(int));
         }
 
-        ifstream inFile(filename, ios::binary);
-        if (!inFile) {
-            return entries;
-        }
-
-        int size;
-        inFile.read(reinterpret_cast<char*>(&size), sizeof(size));
-
-        entries.resize(size);
-        for (int i = 0; i < size; i++) {
-            inFile.read(reinterpret_cast<char*>(&entries[i]), sizeof(Entry));
-        }
-
-        inFile.close();
-        return entries;
+        return values;
     }
 
-    void writeBucket(int bucketIdx, const vector<Entry>& entries) {
-        string filename = getBucketFilename(bucketIdx);
+    vector<IndexEntry> readIndex() {
+        vector<IndexEntry> index;
 
-        ofstream outFile(filename, ios::binary);
-        if (!outFile) {
-            return;
+        if (!fs::exists(indexFile)) {
+            return index;
         }
 
-        int size = entries.size();
-        outFile.write(reinterpret_cast<const char*>(&size), sizeof(size));
+        ifstream idx(indexFile, ios::binary);
+        if (!idx) return index;
 
-        for (const Entry& entry : entries) {
-            outFile.write(reinterpret_cast<const char*>(&entry), sizeof(Entry));
+        int32_t size;
+        idx.read(reinterpret_cast<char*>(&size), sizeof(size));
+
+        index.resize(size);
+        for (int i = 0; i < size; i++) {
+            idx.read(reinterpret_cast<char*>(&index[i]), sizeof(IndexEntry));
         }
 
-        outFile.close();
+        return index;
+    }
+
+    void writeIndex(const vector<IndexEntry>& index) {
+        ofstream idx(indexFile, ios::binary);
+        if (!idx) return;
+
+        int32_t size = index.size();
+        idx.write(reinterpret_cast<const char*>(&size), sizeof(size));
+
+        for (const auto& entry : index) {
+            idx.write(reinterpret_cast<const char*>(&entry), sizeof(IndexEntry));
+        }
     }
 
 public:
     FileStorage() {
-        baseDir = "data";
-        // Create data directory if it doesn't exist
-        if (!fs::exists(baseDir)) {
-            fs::create_directory(baseDir);
+        // Create empty files if they don't exist
+        if (!fs::exists(dataFile)) {
+            ofstream data(dataFile, ios::binary);
+        }
+        if (!fs::exists(indexFile)) {
+            ofstream idx(indexFile, ios::binary);
+            int32_t zero = 0;
+            idx.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
         }
     }
 
     void insert(const string& index, int value) {
-        int bucketIdx = getBucketIndex(index);
-        vector<Entry> entries = readBucket(bucketIdx);
+        auto idx = readIndex();
 
-        // Check if entry already exists
-        bool found = false;
-        for (const Entry& entry : entries) {
-            if (string(entry.index) == index && entry.value == value) {
-                found = true;
-                break;
-            }
-        }
-
-        if (found) {
-            return; // Entry already exists
-        }
-
-        // Add new entry
-        entries.emplace_back(index, value);
-
-        // Sort entries by index and then by value
-        sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
-            int cmp = strcmp(a.index, b.index);
-            if (cmp != 0) return cmp < 0;
-            return a.value < b.value;
+        // Find the index entry
+        auto it = find_if(idx.begin(), idx.end(), [&](const IndexEntry& e) {
+            return string(e.index) == index;
         });
 
-        writeBucket(bucketIdx, entries);
+        vector<int> values;
+
+        if (it != idx.end()) {
+            // Read existing values
+            values = readValues(it->offset, it->count);
+        }
+
+        // Check if value already exists
+        auto vit = lower_bound(values.begin(), values.end(), value);
+        if (vit != values.end() && *vit == value) {
+            return; // Value already exists
+        }
+
+        // Insert new value
+        values.insert(vit, value);
+
+        // Always append to the end of the data file
+        ofstream data(dataFile, ios::binary | ios::app);
+        if (!data) return;
+
+        int64_t offset = data.tellp();
+        for (int v : values) {
+            data.write(reinterpret_cast<const char*>(&v), sizeof(int));
+        }
+
+        if (it != idx.end()) {
+            // Update existing entry
+            it->offset = offset;
+            it->count = values.size();
+        } else {
+            // Add new index entry
+            IndexEntry newEntry;
+            strncpy(newEntry.index, index.c_str(), 64);
+            newEntry.index[64] = '\0';
+            newEntry.offset = offset;
+            newEntry.count = values.size();
+            idx.push_back(newEntry);
+
+            // Sort index by index name
+            sort(idx.begin(), idx.end(), [](const IndexEntry& a, const IndexEntry& b) {
+                return strcmp(a.index, b.index) < 0;
+            });
+        }
+
+        writeIndex(idx);
     }
 
     void remove(const string& index, int value) {
-        int bucketIdx = getBucketIndex(index);
-        vector<Entry> entries = readBucket(bucketIdx);
+        auto idx = readIndex();
 
-        // Find and remove the entry
-        auto it = find_if(entries.begin(), entries.end(), [&](const Entry& entry) {
-            return string(entry.index) == index && entry.value == value;
+        // Find the index entry
+        auto it = find_if(idx.begin(), idx.end(), [&](const IndexEntry& e) {
+            return string(e.index) == index;
         });
 
-        if (it != entries.end()) {
-            entries.erase(it);
-            writeBucket(bucketIdx, entries);
+        if (it == idx.end()) return;
+
+        // Read values
+        vector<int> values = readValues(it->offset, it->count);
+
+        // Find and remove value
+        auto vit = lower_bound(values.begin(), values.end(), value);
+        if (vit != values.end() && *vit == value) {
+            values.erase(vit);
+
+            if (values.empty()) {
+                // Remove the index entry entirely
+                idx.erase(it);
+                writeIndex(idx);
+            } else {
+                // Write back
+                fstream data(dataFile, ios::binary | ios::in | ios::out);
+                if (!data) return;
+
+                data.seekp(it->offset);
+                for (int v : values) {
+                    data.write(reinterpret_cast<const char*>(&v), sizeof(int));
+                }
+
+                it->count = values.size();
+                writeIndex(idx);
+            }
         }
     }
 
     string find(const string& index) {
-        int bucketIdx = getBucketIndex(index);
-        vector<Entry> entries = readBucket(bucketIdx);
+        auto idx = readIndex();
 
-        vector<int> values;
-        for (const Entry& entry : entries) {
-            if (string(entry.index) == index) {
-                values.push_back(entry.value);
-            }
-        }
+        // Find the index entry
+        auto it = find_if(idx.begin(), idx.end(), [&](const IndexEntry& e) {
+            return string(e.index) == index;
+        });
 
-        if (values.empty()) {
+        if (it == idx.end()) {
             return "null";
         }
+
+        vector<int> values = readValues(it->offset, it->count);
 
         stringstream ss;
         for (size_t i = 0; i < values.size(); i++) {
