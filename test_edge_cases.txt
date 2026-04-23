@@ -1,0 +1,12 @@
+10
+insert test 5
+insert test 3
+insert test 7
+insert test 3
+find test
+delete test 5
+find test
+delete test 10
+find test
+delete test 3
+find test
